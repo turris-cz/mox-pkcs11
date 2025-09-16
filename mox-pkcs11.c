@@ -42,8 +42,12 @@ struct session {
 
 static struct session sess;
 
-static const char *path_prefix_old = "/sys/devices/platform/soc/soc:internal-regs@d0000000/soc:internal-regs@d0000000:crypto@0/mox_";
-static const char *path_prefix_new = "/sys/firmware/turris-mox-rwtm/";
+static const char *path_prefixes[] = {
+	"/sys/devices/platform/soc/soc:internal-regs@d0000000/soc:internal-regs@d0000000:crypto@0/mox_/",
+	"/sys/firmware/turris-mox-rwtm/",
+	"/sys/devices/platform/firmware:armada-3700-rwtm/",
+	NULL,
+};
 static const char *path_prefix;
 
 static ck_object_class_t pub_key_class = CKO_PUBLIC_KEY;
@@ -131,14 +135,16 @@ static void mox_sysfs_select_path_prefix(void)
 {
 	int fd;
 
-	path_prefix = path_prefix_new;
-	fd = mox_sysfs_open("pubkey", O_RDONLY);
-	if (fd >= 0) {
-		close(fd);
-		return;
+	/* printf("first prefix: %x:  %s\n", path_prefixes, *path_prefixes); */
+	for (const char **p = path_prefixes; *p; p++) {
+		path_prefix = *p;
+		printf("trying prefix: %x: %s\n", p, path_prefix);
+		fd = mox_sysfs_open("pubkey", O_RDONLY);
+		if (fd >= 0) {
+			close(fd);
+			return;
+		}
 	}
-
-	path_prefix = path_prefix_old;
 }
 
 static int mox_sysfs_read(const char *file, void *buf, int len)
