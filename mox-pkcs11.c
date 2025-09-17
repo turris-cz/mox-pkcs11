@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <keyutils.h>
 #include <openssl/bn.h>
 #include <openssl/ec.h>
 #include <openssl/obj_mac.h>
@@ -31,7 +32,8 @@
 
 #define ARRAY_SIZE(a)		sizeof((a))/sizeof((a)[0])
 
-static struct ck_function_list fnc_list;
+static struct ck_function_list keyctl_fnc_list;
+static struct ck_function_list sysfs_fnc_list;
 
 struct session {
 	int open;
@@ -48,29 +50,31 @@ static const char *path_prefixes[] = {
 	"/sys/devices/platform/firmware:armada-3700-rwtm/",
 	NULL,
 };
-static const char *path_prefix;
 
-static ck_object_class_t pub_key_class = CKO_PUBLIC_KEY;
-static ck_object_class_t priv_key_class = CKO_PRIVATE_KEY;
-static ck_key_type_t ecdsa_key_type = CKK_ECDSA;
-static unsigned char true_val = 1;
-static char key_id[] = "rWTM OTP ECDSA key";
+static const char *path_prefix = NULL;
+static key_serial_t keyctl_key_id;
+
+static ck_object_class_t ck_pub_key_class = CKO_PUBLIC_KEY;
+static ck_object_class_t ck_priv_key_class = CKO_PRIVATE_KEY;
+static ck_key_type_t ck_ecdsa_key_type = CKK_ECDSA;
+static unsigned char ck_true_val = 1;
+static char ck_key_id[] = "rWTM OTP ECDSA key";
 
 static struct ck_attribute pub_attrs[] = {
 	{
 		.type = CKA_CLASS,
-		.value = &pub_key_class,
-		.value_len = sizeof(pub_key_class),
+		.value = &ck_pub_key_class,
+		.value_len = sizeof(ck_pub_key_class),
 	},
 	{
 		.type = CKA_KEY_TYPE,
-		.value = &ecdsa_key_type,
-		.value_len = sizeof(ecdsa_key_type),
+		.value = &ck_ecdsa_key_type,
+		.value_len = sizeof(ck_ecdsa_key_type),
 	},
 	{
 		.type = CKA_ID,
-		.value = &key_id,
-		.value_len = sizeof(key_id),
+		.value = &ck_key_id,
+		.value_len = sizeof(ck_key_id),
 	},
 	{
 		.type = CKA_EC_POINT,
@@ -84,23 +88,23 @@ static struct ck_attribute pub_attrs[] = {
 static struct ck_attribute priv_attrs[] = {
 	{
 		.type = CKA_CLASS,
-		.value = &priv_key_class,
-		.value_len = sizeof(priv_key_class),
+		.value = &ck_priv_key_class,
+		.value_len = sizeof(ck_priv_key_class),
 	},
 	{
 		.type = CKA_KEY_TYPE,
-		.value = &ecdsa_key_type,
-		.value_len = sizeof(ecdsa_key_type),
+		.value = &ck_ecdsa_key_type,
+		.value_len = sizeof(ck_ecdsa_key_type),
 	},
 	{
 		.type = CKA_ID,
-		.value = &key_id,
-		.value_len = sizeof(key_id),
+		.value = &ck_key_id,
+		.value_len = sizeof(ck_key_id),
 	},
 	{
 		.type = CKA_SIGN,
-		.value = &true_val,
-		.value_len = sizeof(true_val),
+		.value = &ck_true_val,
+		.value_len = sizeof(ck_true_val),
 	},
 	{}
 };
@@ -135,11 +139,10 @@ static void mox_sysfs_select_path_prefix(void)
 {
 	int fd;
 
-	/* printf("first prefix: %x:  %s\n", path_prefixes, *path_prefixes); */
 	for (const char **p = path_prefixes; *p; p++) {
 		path_prefix = *p;
-		printf("trying prefix: %x: %s\n", p, path_prefix);
-		fd = mox_sysfs_open("pubkey", O_RDONLY);
+		/* printf("trying prefix: %x: %s\n", p, path_prefix); */
+		fd = mox_sysfs_open("serial_number", O_RDONLY);
 		if (fd >= 0) {
 			close(fd);
 			return;
@@ -165,18 +168,51 @@ static int mox_sysfs_read(const char *file, void *buf, int len)
 	return rd;
 }
 
-static const char *read_pubkey(void)
+static ck_rv_t sysfs_read_pubkey(char *pubkey)
 {
-	static char pubkey[135];
-
 	if (mox_sysfs_read("pubkey", pubkey, 135) != 135)
-		return NULL;
+		return CKR_KEY_NEEDED;
 
 	pubkey[134] = '\0';
 	if (pubkey[0] != '0' || (pubkey[1] != '2' && pubkey[1] != '3'))
-		return NULL;
+		return CKR_KEY_HANDLE_INVALID;
 
-	return pubkey;
+	return CKR_OK;
+}
+
+static ck_rv_t keyctl_read_pubkey(char *pubkey_str, const char *board_sn)
+{
+	key_serial_t keyring_id;
+	char key_desc[46], pubkey[68];
+
+	keyring_id = find_key_by_type_and_desc("keyring", ".turris-signing-keys", 0);
+	if (keyring_id == -1)
+		return CKR_KEY_HANDLE_INVALID;
+
+	snprintf(key_desc, 46, "Turris MOX SN %s rWTM ECDSA key", board_sn);
+
+	keyctl_key_id = keyctl_search(keyring_id, "turris-signing-key", key_desc, 0);
+	/* printf("key id: %d\n", keyctl_key_id); */
+	if (keyctl_key_id == -1)
+		return CKR_KEY_HANDLE_INVALID;
+
+	if (keyctl_read(keyctl_key_id, pubkey, 67) != 67) {
+		/* printf("keyctl_read: %s\n", strerror(errno)); */
+		return CKR_KEY_HANDLE_INVALID;
+	}
+	pubkey[67] = '\0';
+
+	if (pubkey[0] != 2 && pubkey[0] != 3)
+		return CKR_KEY_HANDLE_INVALID;
+
+	/* convert to sysfs form for init_crypto() */
+	for (int i = 0; i < 67; i++) {
+		snprintf(&pubkey_str[i * 2], 3, "%02x", pubkey[i]);
+	}
+	pubkey_str[134] = '\0';
+
+	/* printf("%s\n", pubkey_str); */
+	return CKR_OK;
 }
 
 static int init_crypto(const char *pubkey)
@@ -268,17 +304,58 @@ fail:
 	return -1;
 }
 
-static ck_rv_t Initialize(void *init_args)
+static ck_rv_t keyctl_initialize(void *init_args)
 {
-	const char *pubkey;
+	char buf[10];
+	char board_sn[17];
+	int res;
+
+	char pubkey_str[135];
+
+	mox_sysfs_select_path_prefix();
+
+	if (mox_sysfs_read("serial_number", board_sn, 17) != 17)
+		return CKR_FUNCTION_FAILED;
+	board_sn[16] = '\0';
+
+	/* skip first zero so that we can push in terminating NUL byte */
+	memcpy(token_info.serial_number, &board_sn[1], 15);
+	token_info.serial_number[15] = '\0';
+
+	res = mox_sysfs_read("board_version", buf, 10);
+	if (res < 0)
+		return CKR_FUNCTION_FAILED;
+
+	if (res > 0) {
+		int board_version;
+		buf[res] = '\0';
+		sscanf(buf, "%d", &board_version);
+		token_info.hardware_version.major = board_version;
+	}
+
+	res = keyctl_read_pubkey(pubkey_str, board_sn);
+	if (res != CKR_OK)
+		return res;
+
+	if (init_crypto(pubkey_str))
+		return CKR_FUNCTION_FAILED;
+
+	sess.open = 0;
+
+	return CKR_OK;
+}
+
+static ck_rv_t sysfs_initialize(void *init_args)
+{
+	char pubkey[135];
 	char buf[17];
 	int res;
 
 	mox_sysfs_select_path_prefix();
 
-	pubkey = read_pubkey();
-	if (!pubkey)
-		return CKR_FUNCTION_FAILED;
+	res = sysfs_read_pubkey(pubkey);
+	if (res != CKR_OK)
+		return res;
 
 	if (mox_sysfs_read("serial_number", buf, 17) != 17)
 		return CKR_FUNCTION_FAILED;
@@ -340,7 +417,12 @@ static ck_rv_t GetInfo(struct ck_info *pinfo)
 
 ck_rv_t C_GetFunctionList(struct ck_function_list **pplist)
 {
-	*pplist = &fnc_list;
+	if (find_key_by_type_and_desc("keyring", ".turris-signing-keys", 0) != -1) {
+		*pplist = &keyctl_fnc_list;
+	} else {
+		/* fallback */
+		*pplist = &sysfs_fnc_list;
+	}
 	return CKR_OK;
 }
 
@@ -585,7 +667,30 @@ static ck_rv_t SignInit(ck_session_handle_t session,
 	return CKR_OK;
 }
 
-static ck_rv_t Sign(ck_session_handle_t session,
+static ck_rv_t keyctl_sign(ck_session_handle_t session,
+		    unsigned char *data, unsigned long data_len,
+		    unsigned char *signature,
+		    unsigned long *signature_len)
+{
+	int res;
+
+	if (session != 1 || !sess.open)
+		return CKR_SESSION_HANDLE_INVALID;
+
+	if (data_len != 64)
+		return CKR_DATA_LEN_RANGE;
+
+	*signature_len = 132;
+	res = keyctl_pkey_sign(keyctl_key_id, "",
+			data, data_len,
+			signature, *signature_len);
+	if (res == -1)
+		return CKR_FUNCTION_FAILED;
+
+	return CKR_OK;
+}
+
+static ck_rv_t sysfs_sign(ck_session_handle_t session,
 		    unsigned char *data, unsigned long data_len,
 		    unsigned char *signature,
 		    unsigned long *signature_len)
@@ -600,13 +705,14 @@ static ck_rv_t Sign(ck_session_handle_t session,
 		return CKR_DATA_LEN_RANGE;
 
 	fd = mox_sysfs_open("do_sign", O_RDWR);
-	if (fd < 0)
-		return CKR_FUNCTION_FAILED;
+	if (fd < 0) {
+		/* fallback */
+		fd = open("/sys/kernel/debug/turris-mox-rwtm/do_sign", O_RDWR);
+		if (fd < 0)
+			return CKR_FUNCTION_FAILED;
+	}
 
 	if (write(fd, data, data_len) != data_len)
-		goto fail;
-
-	if (lseek(fd, 0, SEEK_SET) < 0)
 		goto fail;
 
 	if (read(fd, sig, 136) != 136)
@@ -624,12 +730,15 @@ fail:
 	return CKR_FUNCTION_FAILED;
 }
 
-static struct ck_function_list fnc_list = {
+/*
+ * Used when keyctl API for MOX is supported (Linux >=6.16)
+ */
+static struct ck_function_list keyctl_fnc_list = {
 	.version = {
 		.major = CRYPTOKI_VERSION_MAJOR,
 		.minor = CRYPTOKI_VERSION_MINOR,
 	},
-	.C_Initialize = Initialize,
+	.C_Initialize = keyctl_initialize,
 	.C_Finalize = Finalize,
 	.C_GetInfo = GetInfo,
 	.C_GetFunctionList = C_GetFunctionList,
@@ -646,5 +755,34 @@ static struct ck_function_list fnc_list = {
 	.C_GetAttributeValue = GetAttributeValue,
 
 	.C_SignInit = SignInit,
-	.C_Sign = Sign,
+	.C_Sign = keyctl_sign,
+};
+
+/*
+ * Used as fallback when keyctl API for accessing the key is not supported
+ * (Linux <=6.15)
+ */
+static struct ck_function_list sysfs_fnc_list = {
+	.version = {
+		.major = CRYPTOKI_VERSION_MAJOR,
+		.minor = CRYPTOKI_VERSION_MINOR,
+	},
+	.C_Initialize = sysfs_initialize,
+	.C_Finalize = Finalize,
+	.C_GetInfo = GetInfo,
+	.C_GetFunctionList = C_GetFunctionList,
+	.C_GetSlotList = GetSlotList,
+	.C_GetSlotInfo = GetSlotInfo,
+	.C_GetTokenInfo = GetTokenInfo,
+
+	.C_OpenSession = OpenSession,
+	.C_CloseSession = CloseSession,
+	.C_FindObjectsInit = FindObjectsInit,
+	.C_FindObjects = FindObjects,
+	.C_FindObjectsFinal = FindObjectsFinal,
+
+	.C_GetAttributeValue = GetAttributeValue,
+
+	.C_SignInit = SignInit,
+	.C_Sign = sysfs_sign,
 };
