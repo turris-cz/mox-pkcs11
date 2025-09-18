@@ -125,6 +125,17 @@ static struct ck_token_info token_info = {
 	}
 };
 
+static const char hex_asc[] = "0123456789abcdef";
+
+static void bin2hex(char *hex, char *bin, size_t len)
+{
+	while (len--) {
+		*hex++ = hex_asc[(*bin & 0xf0) >> 4];
+		*hex++ = hex_asc[*bin++ & 0x0f];
+	}
+	*hex = '\0';
+}
+
 static int mox_sysfs_open(const char *file, int flags)
 {
 	char path[128];
@@ -206,12 +217,10 @@ static ck_rv_t keyctl_read_pubkey(char *pubkey_str, const char *board_sn)
 		return CKR_KEY_HANDLE_INVALID;
 
 	/* convert to sysfs form for init_crypto() */
-	for (int i = 0; i < 67; i++) {
-		snprintf(&pubkey_str[i * 2], 3, "%02x", pubkey[i]);
-	}
-	pubkey_str[134] = '\0';
+	bin2hex(pubkey_str, pubkey, 67);
 
 	/* printf("%s\n", pubkey_str); */
+
 	return CKR_OK;
 }
 
@@ -417,12 +426,10 @@ static ck_rv_t GetInfo(struct ck_info *pinfo)
 
 ck_rv_t C_GetFunctionList(struct ck_function_list **pplist)
 {
-	if (find_key_by_type_and_desc("keyring", ".turris-signing-keys", 0) != -1) {
+	if (find_key_by_type_and_desc("keyring", ".turris-signing-keys", 0) != -1)
 		*pplist = &keyctl_fnc_list;
-	} else {
-		/* fallback */
-		*pplist = &sysfs_fnc_list;
-	}
+	else
+		*pplist = &sysfs_fnc_list; /* fallback */
 	return CKR_OK;
 }
 
@@ -706,7 +713,7 @@ static ck_rv_t sysfs_sign(ck_session_handle_t session,
 
 	fd = mox_sysfs_open("do_sign", O_RDWR);
 	if (fd < 0) {
-		/* fallback */
+		/* fallback when not on Turris OS */
 		fd = open("/sys/kernel/debug/turris-mox-rwtm/do_sign", O_RDWR);
 		if (fd < 0)
 			return CKR_FUNCTION_FAILED;
