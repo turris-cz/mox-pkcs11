@@ -152,13 +152,14 @@ static void mox_sysfs_select_path_prefix(void)
 
 	for (const char **p = path_prefixes; *p; p++) {
 		path_prefix = *p;
-		/* printf("trying prefix: %x: %s\n", p, path_prefix); */
 		fd = mox_sysfs_open("serial_number", O_RDONLY);
 		if (fd >= 0) {
 			close(fd);
 			return;
 		}
 	}
+	path_prefix = NULL;
+	return;
 }
 
 static int mox_sysfs_read(const char *file, void *buf, int len)
@@ -182,11 +183,11 @@ static int mox_sysfs_read(const char *file, void *buf, int len)
 static ck_rv_t sysfs_read_pubkey(char *pubkey)
 {
 	if (mox_sysfs_read("pubkey", pubkey, 135) != 135)
-		return CKR_KEY_NEEDED;
+		return CKR_DEVICE_ERROR;
 
 	pubkey[134] = '\0';
 	if (pubkey[0] != '0' || (pubkey[1] != '2' && pubkey[1] != '3'))
-		return CKR_KEY_HANDLE_INVALID;
+		return CKR_DEVICE_ERROR;
 
 	return CKR_OK;
 }
@@ -198,28 +199,24 @@ static ck_rv_t keyctl_read_pubkey(char *pubkey_str, const char *board_sn)
 
 	keyring_id = find_key_by_type_and_desc("keyring", ".turris-signing-keys", 0);
 	if (keyring_id == -1)
-		return CKR_KEY_HANDLE_INVALID;
+		return CKR_DEVICE_ERROR;
 
 	snprintf(key_desc, 46, "Turris MOX SN %s rWTM ECDSA key", board_sn);
 
 	keyctl_key_id = keyctl_search(keyring_id, "turris-signing-key", key_desc, 0);
-	/* printf("key id: %d\n", keyctl_key_id); */
 	if (keyctl_key_id == -1)
-		return CKR_KEY_HANDLE_INVALID;
+		return CKR_DEVICE_ERROR;
 
 	if (keyctl_read(keyctl_key_id, pubkey, 67) != 67) {
-		/* printf("keyctl_read: %s\n", strerror(errno)); */
-		return CKR_KEY_HANDLE_INVALID;
+		return CKR_DEVICE_ERROR;
 	}
 	pubkey[67] = '\0';
 
 	if (pubkey[0] != 2 && pubkey[0] != 3)
-		return CKR_KEY_HANDLE_INVALID;
+		return CKR_DEVICE_ERROR;
 
 	/* convert to sysfs form for init_crypto() */
 	bin2hex(pubkey_str, pubkey, 67);
-
-	/* printf("%s\n", pubkey_str); */
 
 	return CKR_OK;
 }
@@ -315,16 +312,14 @@ fail:
 
 static ck_rv_t keyctl_initialize(void *init_args)
 {
-	char buf[10];
+	char buf[11];
 	char board_sn[17];
 	int res;
 
 	char pubkey_str[135];
 
-	mox_sysfs_select_path_prefix();
-
 	if (mox_sysfs_read("serial_number", board_sn, 17) != 17)
-		return CKR_FUNCTION_FAILED;
+		return CKR_DEVICE_ERROR;
 	board_sn[16] = '\0';
 
 	/* skip first zero so that we can push in terminating NUL byte */
@@ -333,12 +328,16 @@ static ck_rv_t keyctl_initialize(void *init_args)
 
 	res = mox_sysfs_read("board_version", buf, 10);
 	if (res < 0)
-		return CKR_FUNCTION_FAILED;
+		return CKR_DEVICE_ERROR;
 
 	if (res > 0) {
 		int board_version;
 		buf[res] = '\0';
+
+		errno = 0;
 		sscanf(buf, "%d", &board_version);
+		if (errno != 0)
+			return CKR_DEVICE_ERROR;
 		token_info.hardware_version.major = board_version;
 	}
 
@@ -360,14 +359,12 @@ static ck_rv_t sysfs_initialize(void *init_args)
 	char buf[17];
 	int res;
 
-	mox_sysfs_select_path_prefix();
-
 	res = sysfs_read_pubkey(pubkey);
 	if (res != CKR_OK)
 		return res;
 
 	if (mox_sysfs_read("serial_number", buf, 17) != 17)
-		return CKR_FUNCTION_FAILED;
+		return CKR_DEVICE_ERROR;
 
 	/* skip first zero so that we can push in terminating NUL byte */
 	memcpy(token_info.serial_number, &buf[1], 15);
@@ -375,13 +372,16 @@ static ck_rv_t sysfs_initialize(void *init_args)
 
 	res = mox_sysfs_read("board_version", buf, 10);
 	if (res < 0)
-		return CKR_FUNCTION_FAILED;
+		return CKR_DEVICE_ERROR;
 
 	if (res > 0) {
 		int board_version;
-
 		buf[res] = '\0';
+
+		errno = 0;
 		sscanf(buf, "%d", &board_version);
+		if (errno != 0)
+			return CKR_DEVICE_ERROR;
 		token_info.hardware_version.major = board_version;
 	}
 
@@ -426,6 +426,10 @@ static ck_rv_t GetInfo(struct ck_info *pinfo)
 
 ck_rv_t C_GetFunctionList(struct ck_function_list **pplist)
 {
+	mox_sysfs_select_path_prefix();
+	if (path_prefix == NULL)
+		return CKR_TOKEN_NOT_PRESENT;
+
 	if (find_key_by_type_and_desc("keyring", ".turris-signing-keys", 0) != -1)
 		*pplist = &keyctl_fnc_list;
 	else
