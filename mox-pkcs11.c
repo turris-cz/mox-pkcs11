@@ -702,8 +702,9 @@ static ck_rv_t sysfs_sign(ck_session_handle_t session,
 		    unsigned char *signature,
 		    unsigned long *signature_len)
 {
-	unsigned char sig[136];
 	int fd;
+	unsigned char sig[136];
+	unsigned char use_debugfs = 0;
 
 	if (session != 1 || !sess.open)
 		return CKR_SESSION_HANDLE_INVALID;
@@ -711,16 +712,27 @@ static ck_rv_t sysfs_sign(ck_session_handle_t session,
 	if (data_len != 64)
 		return CKR_DATA_LEN_RANGE;
 
-	fd = mox_sysfs_open("do_sign", O_RDWR);
-	if (fd < 0) {
-		/* fallback when not on Turris OS */
-		fd = open("/sys/kernel/debug/turris-mox-rwtm/do_sign", O_RDWR);
+	fd = open("/sys/kernel/debug/turris-mox-rwtm/do_sign", O_RDWR);
+	if (fd >= 0)
+		use_debugfs = 1;
+	else {
+		/* on old versions of turris os */
+		use_debugfs = 0;
+		fd = mox_sysfs_open("do_sign", O_RDWR);
 		if (fd < 0)
 			return CKR_FUNCTION_FAILED;
 	}
 
+	/* flush in the case of pending previous sig */
+	read(fd, sig, 136);
+
 	if (write(fd, data, data_len) != data_len)
 		goto fail;
+
+	/* seek only on sysfs */
+	if (!use_debugfs)
+		if (lseek(fd, 0, SEEK_SET) < 0)
+			goto fail;
 
 	if (read(fd, sig, 136) != 136)
 		goto fail;
