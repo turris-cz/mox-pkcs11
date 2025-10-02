@@ -22,15 +22,21 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+
 #include <keyutils.h>
+
+#include <openssl/asn1.h>
 #include <openssl/bn.h>
 #include <openssl/ec.h>
+#include <openssl/evp.h>
+#include <openssl/param_build.h>
+#include <openssl/params.h>
 #include <openssl/obj_mac.h>
 
 #define CRYPTOKI_GNU
 #include "pkcs11.h"
 
-#define ARRAY_SIZE(a)		sizeof((a))/sizeof((a)[0])
+#define ARRAY_SIZE(a)		(sizeof((a))/sizeof((a)[0]))
 
 static struct ck_function_list keyctl_fnc_list;
 static struct ck_function_list sysfs_fnc_list;
@@ -212,102 +218,156 @@ static ck_rv_t keyctl_read_pubkey(char *pubkey_str, const char *board_sn)
 	}
 	pubkey[67] = '\0';
 
-	if (pubkey[0] != 2 && pubkey[0] != 3)
-		return CKR_DEVICE_ERROR;
-
 	/* convert to sysfs form for init_crypto() */
 	bin2hex(pubkey_str, pubkey, 67);
+
+	pubkey[134] = '\0';
+	if (pubkey[0] != '0' || (pubkey[1] != '2' && pubkey[1] != '3'))
+		return CKR_DEVICE_ERROR;
 
 	return CKR_OK;
 }
 
 static int init_crypto(const char *pubkey)
 {
-	EC_KEY *key;
-	BN_CTX *ctx;
-	EC_POINT *pub;
-	BIGNUM *pub_x;
-	unsigned char *des_pubkey;
-	int des_pubkey_len;
+	BN_CTX *bn_ctx;
+	EC_GROUP *group;
+	BIGNUM *pub_bn;
+	EC_POINT *pub_point;
+	unsigned char *compr_point_buf;
+	size_t compr_point_len;
+	OSSL_PARAM_BLD *param_bld;
+	OSSL_PARAM *params = NULL;
+	EVP_PKEY_CTX *ctx;
+	EVP_PKEY *pkey = NULL;
+	unsigned char *der_pubkey = NULL;
+	size_t der_pubkey_len;
 	ASN1_OCTET_STRING *asn1_pubkey;
-	const EC_GROUP *group;
 
-	key = EC_KEY_new_by_curve_name(NID_secp521r1);
-	if (!key)
-		goto fail;
+	bn_ctx = BN_CTX_new();
+	if (bn_ctx == NULL)
+		goto fail_bn_new;
 
-	group = EC_KEY_get0_group(key);
+	BN_CTX_start(bn_ctx);
+	pub_bn = BN_CTX_get(bn_ctx);
+	if (!pub_bn)
+		goto fail_bn;
 
-	ctx = BN_CTX_new();
-	if (!ctx)
-		goto fail_free_key;
+	if (!BN_hex2bn(&pub_bn, pubkey + 2))
+		goto fail_bn;
 
-	BN_CTX_start(ctx);
-	pub_x = BN_CTX_get(ctx);
-	if (!pub_x)
-		goto fail_end_ctx;
+	group = EC_GROUP_new_by_curve_name(NID_secp521r1);
+	if (group == NULL)
+		goto fail_group;
 
-	if (!BN_hex2bn(&pub_x, pubkey + 2))
-		goto fail_end_ctx;
+	pub_point = EC_POINT_new(group);
+	if (!pub_point)
+		goto fail_point;
 
-	pub = EC_POINT_new(group);
-	if (!pub)
-		goto fail_end_ctx;
+        if (!EC_POINT_set_compressed_coordinates(group, pub_point, pub_bn, pubkey[1] == '3', bn_ctx))
+                goto fail_point;
 
-	if (!EC_POINT_set_compressed_coordinates_GFp(group, pub, pub_x, pubkey[1] == '3', ctx))
-		goto fail_free_pub;
+	compr_point_len = EC_POINT_point2buf(group, pub_point, POINT_CONVERSION_COMPRESSED, &compr_point_buf, bn_ctx);
+	if (compr_point_len == 0)
+		goto fail_point_buf;
 
-	if (!EC_KEY_set_public_key(key, pub))
-		goto fail_free_pub;
+#ifdef MOX_DEBUG
+	printf("printing\n");
+	printf("0x%x\n", compr_point_len);
+	for (size_t i = 0; i < compr_point_len; i++)
+		printf("%02x ", compr_point_buf[i]);
+	printf("\n");
+#endif
+
+	param_bld = OSSL_PARAM_BLD_new();
+	if (param_bld == NULL
+		|| !OSSL_PARAM_BLD_push_utf8_string(param_bld, "group",
+			"secp521r1", 0)
+		|| !OSSL_PARAM_BLD_push_octet_string(param_bld, "pub",
+			compr_point_buf, compr_point_len)
+		)
+		goto fail_param_bld;
+
+	params = OSSL_PARAM_BLD_to_param(param_bld);
+	if (params == NULL)
+		goto fail_params;
+
+	ctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
+	if (ctx == NULL)
+		goto fail_pkey_ctx;
+
+	if (EVP_PKEY_fromdata_init(ctx) <= 0)
+		goto fail_pkey_ctx;
+
+	if (EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_PUBLIC_KEY, params) <= 0)
+		goto fail_pkey;
 
 	pub_attrs[4].value = NULL;
-	pub_attrs[4].value_len = i2d_ECParameters(key, (unsigned char **)&pub_attrs[4].value);
-	if (pub_attrs[4].value_len < 0)
-		goto fail_free_pub;
+	pub_attrs[4].value_len = i2d_KeyParams(pkey,
+			(unsigned char **)&pub_attrs[4].value);
+	if (pub_attrs[4].value_len == 0)
+		goto fail_attr_params;
 
-	des_pubkey = NULL;
-	des_pubkey_len = i2o_ECPublicKey(key, &des_pubkey);
-	if (des_pubkey_len < 0)
-		goto fail_free_ec_params;
+	der_pubkey_len = EVP_PKEY_get1_encoded_public_key(pkey, &der_pubkey);
+	if (der_pubkey_len == 0)
+		goto fail_der_pubkey;
 
 	asn1_pubkey = ASN1_OCTET_STRING_new();
 	if (!asn1_pubkey)
-		goto fail_free_des_pubkey;
-	if (!ASN1_OCTET_STRING_set(asn1_pubkey, des_pubkey, des_pubkey_len))
-		goto fail_free_asn1_pubkey;
+		goto fail_der_pubkey;
+	if (!ASN1_OCTET_STRING_set(asn1_pubkey, der_pubkey, der_pubkey_len))
+		goto fail_asn1_pubkey;
 
 	pub_attrs[3].value = NULL;
 	pub_attrs[3].value_len = i2d_ASN1_OCTET_STRING(asn1_pubkey, (unsigned char **)&pub_attrs[3].value);
 	if (pub_attrs[3].value_len < 0)
-		goto fail_free_asn1_pubkey;
+		goto fail_attr_point;
 
-	free(asn1_pubkey);
-	free(des_pubkey);
-	EC_POINT_free(pub);
-	BN_CTX_end(ctx);
-	BN_CTX_free(ctx);
-	EC_KEY_free(key);
+	OPENSSL_free(asn1_pubkey);
+	OPENSSL_free(der_pubkey);
+	EVP_PKEY_free(pkey);
+	EVP_PKEY_CTX_free(ctx);
+	OSSL_PARAM_free(params);
+	OSSL_PARAM_BLD_free(param_bld);
+	free(compr_point_buf);
+	EC_POINT_free(pub_point);
+	EC_GROUP_free(group);
+	BN_CTX_end(bn_ctx);
+	BN_CTX_free(bn_ctx);
 
-	return 0;
+	return CKR_OK;
 
-fail_free_asn1_pubkey:
-	free(asn1_pubkey);
-fail_free_des_pubkey:
-	free(des_pubkey);
-fail_free_ec_params:
-	free(pub_attrs[4].value);
-fail_free_pub:
-	EC_POINT_free(pub);
-fail_end_ctx:
-	BN_CTX_end(ctx);
-	BN_CTX_free(ctx);
-fail_free_key:
-	EC_KEY_free(key);
-fail:
+fail_attr_point:
+	OPENSSL_free(pub_attrs[3].value);
+fail_asn1_pubkey:
+	OPENSSL_free(asn1_pubkey);
+fail_der_pubkey:
+	OPENSSL_free(der_pubkey);
+fail_attr_params:
+	OPENSSL_free(pub_attrs[4].value);
+fail_pkey:
+	EVP_PKEY_free(pkey);
+fail_pkey_ctx:
+	EVP_PKEY_CTX_free(ctx);
+fail_params:
+	OSSL_PARAM_free(params);
+fail_param_bld:
+	OSSL_PARAM_BLD_free(param_bld);
+fail_point_buf:
+	free(compr_point_buf);
+fail_point:
+	EC_POINT_free(pub_point);
+fail_group:
+	EC_GROUP_free(group);
+fail_bn:
+	BN_CTX_end(bn_ctx);
+fail_bn_new:
+	BN_CTX_free(bn_ctx);
+
 	pub_attrs[3].value = pub_attrs[4].value = NULL;
 	pub_attrs[3].value_len = pub_attrs[4].value_len = 0;
 
-	return -1;
+	return CKR_FUNCTION_FAILED;
 }
 
 static ck_rv_t keyctl_initialize(void *init_args)
@@ -316,7 +376,7 @@ static ck_rv_t keyctl_initialize(void *init_args)
 	char board_sn[17];
 	int res;
 
-	char pubkey_str[135];
+	char pubkey[135];
 
 	if (mox_sysfs_read("serial_number", board_sn, 17) != 17)
 		return CKR_DEVICE_ERROR;
@@ -341,12 +401,13 @@ static ck_rv_t keyctl_initialize(void *init_args)
 		token_info.hardware_version.major = board_version;
 	}
 
-	res = keyctl_read_pubkey(pubkey_str, board_sn);
+	res = keyctl_read_pubkey(pubkey, board_sn);
 	if (res != CKR_OK)
 		return res;
 
-	if (init_crypto(pubkey_str))
-		return CKR_FUNCTION_FAILED;
+	res = init_crypto(pubkey);
+	if (res != CKR_OK)
+		return res;
 
 	sess.open = 0;
 
@@ -385,8 +446,9 @@ static ck_rv_t sysfs_initialize(void *init_args)
 		token_info.hardware_version.major = board_version;
 	}
 
-	if (init_crypto(pubkey))
-		return CKR_FUNCTION_FAILED;
+	res = init_crypto(pubkey);
+	if (res != CKR_OK)
+		return res;
 
 	sess.open = 0;
 
