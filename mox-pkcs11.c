@@ -14,7 +14,6 @@
  */
 
 #define _GNU_SOURCE
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -191,6 +190,7 @@ static ck_rv_t sysfs_read_pubkey(char *pubkey)
 	if (mox_sysfs_read("pubkey", pubkey, 135) != 135)
 		return CKR_DEVICE_ERROR;
 
+	/* first two digits determine the y-bit */
 	pubkey[134] = '\0';
 	if (pubkey[0] != '0' || (pubkey[1] != '2' && pubkey[1] != '3'))
 		return CKR_DEVICE_ERROR;
@@ -198,31 +198,32 @@ static ck_rv_t sysfs_read_pubkey(char *pubkey)
 	return CKR_OK;
 }
 
-static ck_rv_t keyctl_read_pubkey(char *pubkey_str, const char *board_sn)
+static ck_rv_t keyctl_read_pubkey(char *pubkey_str)
 {
 	key_serial_t keyring_id;
-	char key_desc[46], pubkey[68];
+	char key_desc[46], pubkey_bin[68];
 
 	keyring_id = find_key_by_type_and_desc("keyring", ".turris-signing-keys", 0);
 	if (keyring_id == -1)
 		return CKR_DEVICE_ERROR;
 
-	snprintf(key_desc, 46, "Turris MOX SN %s rWTM ECDSA key", board_sn);
+	snprintf(key_desc, 46, "Turris MOX SN %.16s rWTM ECDSA key", token_info.serial_number);
 
 	keyctl_key_id = keyctl_search(keyring_id, "turris-signing-key", key_desc, 0);
 	if (keyctl_key_id == -1)
 		return CKR_DEVICE_ERROR;
 
-	if (keyctl_read(keyctl_key_id, pubkey, 67) != 67) {
+	if (keyctl_read(keyctl_key_id, pubkey_bin, 67) != 67) {
 		return CKR_DEVICE_ERROR;
 	}
-	pubkey[67] = '\0';
+	pubkey_bin[67] = '\0';
 
 	/* convert to sysfs form for init_crypto() */
-	bin2hex(pubkey_str, pubkey, 67);
+	bin2hex(pubkey_str, pubkey_bin, 67);
+	pubkey_str[134] = '\0';
 
-	pubkey[134] = '\0';
-	if (pubkey[0] != '0' || (pubkey[1] != '2' && pubkey[1] != '3'))
+	/* first two digits determine the y-bit */
+	if (pubkey_str[0] != '0' || (pubkey_str[1] != '2' && pubkey_str[1] != '3'))
 		return CKR_DEVICE_ERROR;
 
 	return CKR_OK;
@@ -370,38 +371,42 @@ fail_bn_new:
 	return CKR_FUNCTION_FAILED;
 }
 
-static ck_rv_t keyctl_initialize(void *init_args)
+static ck_rv_t init_token()
 {
-	char buf[11];
-	char board_sn[17];
+	char buf[16];
 	int res;
 
-	char pubkey[135];
-
-	if (mox_sysfs_read("serial_number", board_sn, 17) != 17)
+	if (mox_sysfs_read("serial_number", buf, 16) != 16)
 		return CKR_DEVICE_ERROR;
-	board_sn[16] = '\0';
 
-	/* skip first zero so that we can push in terminating NUL byte */
-	memcpy(token_info.serial_number, &board_sn[1], 15);
-	token_info.serial_number[15] = '\0';
+	memcpy(token_info.serial_number, &buf, 16);
 
 	res = mox_sysfs_read("board_version", buf, 10);
 	if (res < 0)
 		return CKR_DEVICE_ERROR;
-
-	if (res > 0) {
+	else {
 		int board_version;
 		buf[res] = '\0';
 
-		errno = 0;
-		sscanf(buf, "%d", &board_version);
-		if (errno != 0)
+		if (sscanf(buf, "%d", &board_version) != 1)
 			return CKR_DEVICE_ERROR;
+
 		token_info.hardware_version.major = board_version;
 	}
 
-	res = keyctl_read_pubkey(pubkey, board_sn);
+	return CKR_OK;
+}
+
+static ck_rv_t keyctl_initialize(void *init_args)
+{
+	int res;
+	char pubkey[135];
+
+	res = init_token();
+	if (res != CKR_OK)
+		return res;
+
+	res = keyctl_read_pubkey(pubkey);
 	if (res != CKR_OK)
 		return res;
 
@@ -416,35 +421,16 @@ static ck_rv_t keyctl_initialize(void *init_args)
 
 static ck_rv_t sysfs_initialize(void *init_args)
 {
-	char pubkey[135];
-	char buf[17];
 	int res;
+	char pubkey[135];
+
+	res = init_token();
+	if (res != CKR_OK)
+		return res;
 
 	res = sysfs_read_pubkey(pubkey);
 	if (res != CKR_OK)
 		return res;
-
-	if (mox_sysfs_read("serial_number", buf, 17) != 17)
-		return CKR_DEVICE_ERROR;
-
-	/* skip first zero so that we can push in terminating NUL byte */
-	memcpy(token_info.serial_number, &buf[1], 15);
-	token_info.serial_number[15] = '\0';
-
-	res = mox_sysfs_read("board_version", buf, 10);
-	if (res < 0)
-		return CKR_DEVICE_ERROR;
-
-	if (res > 0) {
-		int board_version;
-		buf[res] = '\0';
-
-		errno = 0;
-		sscanf(buf, "%d", &board_version);
-		if (errno != 0)
-			return CKR_DEVICE_ERROR;
-		token_info.hardware_version.major = board_version;
-	}
 
 	res = init_crypto(pubkey);
 	if (res != CKR_OK)
