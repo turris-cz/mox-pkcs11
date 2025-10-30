@@ -14,7 +14,6 @@
  */
 
 #define _GNU_SOURCE
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,16 +21,24 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+#include <keyutils.h>
+
+#include <openssl/asn1.h>
 #include <openssl/bn.h>
 #include <openssl/ec.h>
+#include <openssl/evp.h>
+#include <openssl/param_build.h>
+#include <openssl/params.h>
 #include <openssl/obj_mac.h>
 
 #define CRYPTOKI_GNU
 #include "pkcs11.h"
 
-#define ARRAY_SIZE(a)		sizeof((a))/sizeof((a)[0])
+#define ARRAY_SIZE(a)		(sizeof((a))/sizeof((a)[0]))
 
-static struct ck_function_list fnc_list;
+static struct ck_function_list keyctl_fnc_list;
+static struct ck_function_list sysfs_fnc_list;
 
 struct session {
 	int open;
@@ -42,31 +49,37 @@ struct session {
 
 static struct session sess;
 
-static const char *path_prefix_old = "/sys/devices/platform/soc/soc:internal-regs@d0000000/soc:internal-regs@d0000000:crypto@0/mox_";
-static const char *path_prefix_new = "/sys/firmware/turris-mox-rwtm/";
-static const char *path_prefix;
+static const char *path_prefixes[] = {
+	"/sys/devices/platform/soc/soc:internal-regs@d0000000/soc:internal-regs@d0000000:crypto@0/mox_/",
+	"/sys/firmware/turris-mox-rwtm/",
+	"/sys/devices/platform/firmware:armada-3700-rwtm/",
+	NULL,
+};
 
-static ck_object_class_t pub_key_class = CKO_PUBLIC_KEY;
-static ck_object_class_t priv_key_class = CKO_PRIVATE_KEY;
-static ck_key_type_t ecdsa_key_type = CKK_ECDSA;
-static unsigned char true_val = 1;
-static char key_id[] = "rWTM OTP ECDSA key";
+static const char *path_prefix = NULL;
+static key_serial_t keyctl_key_id;
+
+static ck_object_class_t ck_pub_key_class = CKO_PUBLIC_KEY;
+static ck_object_class_t ck_priv_key_class = CKO_PRIVATE_KEY;
+static ck_key_type_t ck_ecdsa_key_type = CKK_ECDSA;
+static unsigned char ck_true_val = 1;
+static char ck_key_id[] = "rWTM OTP ECDSA key";
 
 static struct ck_attribute pub_attrs[] = {
 	{
 		.type = CKA_CLASS,
-		.value = &pub_key_class,
-		.value_len = sizeof(pub_key_class),
+		.value = &ck_pub_key_class,
+		.value_len = sizeof(ck_pub_key_class),
 	},
 	{
 		.type = CKA_KEY_TYPE,
-		.value = &ecdsa_key_type,
-		.value_len = sizeof(ecdsa_key_type),
+		.value = &ck_ecdsa_key_type,
+		.value_len = sizeof(ck_ecdsa_key_type),
 	},
 	{
 		.type = CKA_ID,
-		.value = &key_id,
-		.value_len = sizeof(key_id),
+		.value = &ck_key_id,
+		.value_len = sizeof(ck_key_id),
 	},
 	{
 		.type = CKA_EC_POINT,
@@ -80,23 +93,23 @@ static struct ck_attribute pub_attrs[] = {
 static struct ck_attribute priv_attrs[] = {
 	{
 		.type = CKA_CLASS,
-		.value = &priv_key_class,
-		.value_len = sizeof(priv_key_class),
+		.value = &ck_priv_key_class,
+		.value_len = sizeof(ck_priv_key_class),
 	},
 	{
 		.type = CKA_KEY_TYPE,
-		.value = &ecdsa_key_type,
-		.value_len = sizeof(ecdsa_key_type),
+		.value = &ck_ecdsa_key_type,
+		.value_len = sizeof(ck_ecdsa_key_type),
 	},
 	{
 		.type = CKA_ID,
-		.value = &key_id,
-		.value_len = sizeof(key_id),
+		.value = &ck_key_id,
+		.value_len = sizeof(ck_key_id),
 	},
 	{
 		.type = CKA_SIGN,
-		.value = &true_val,
-		.value_len = sizeof(true_val),
+		.value = &ck_true_val,
+		.value_len = sizeof(ck_true_val),
 	},
 	{}
 };
@@ -117,6 +130,17 @@ static struct ck_token_info token_info = {
 	}
 };
 
+static const char hex_asc[] = "0123456789abcdef";
+
+static void bin2hex(char *hex, char *bin, size_t len)
+{
+	while (len--) {
+		*hex++ = hex_asc[(*bin & 0xf0) >> 4];
+		*hex++ = hex_asc[*bin++ & 0x0f];
+	}
+	*hex = '\0';
+}
+
 static int mox_sysfs_open(const char *file, int flags)
 {
 	char path[128];
@@ -131,14 +155,16 @@ static void mox_sysfs_select_path_prefix(void)
 {
 	int fd;
 
-	path_prefix = path_prefix_new;
-	fd = mox_sysfs_open("pubkey", O_RDONLY);
-	if (fd >= 0) {
-		close(fd);
-		return;
+	for (const char **p = path_prefixes; *p; p++) {
+		path_prefix = *p;
+		fd = mox_sysfs_open("serial_number", O_RDONLY);
+		if (fd >= 0) {
+			close(fd);
+			return;
+		}
 	}
-
-	path_prefix = path_prefix_old;
+	path_prefix = NULL;
+	return;
 }
 
 static int mox_sysfs_read(const char *file, void *buf, int len)
@@ -159,142 +185,256 @@ static int mox_sysfs_read(const char *file, void *buf, int len)
 	return rd;
 }
 
-static const char *read_pubkey(void)
+static ck_rv_t sysfs_read_pubkey(char *pubkey)
 {
-	static char pubkey[135];
-
 	if (mox_sysfs_read("pubkey", pubkey, 135) != 135)
-		return NULL;
+		return CKR_DEVICE_ERROR;
 
+	/* first two digits determine the y-bit */
 	pubkey[134] = '\0';
 	if (pubkey[0] != '0' || (pubkey[1] != '2' && pubkey[1] != '3'))
-		return NULL;
+		return CKR_DEVICE_ERROR;
 
-	return pubkey;
+	return CKR_OK;
+}
+
+static ck_rv_t keyctl_read_pubkey(char *pubkey_str)
+{
+	key_serial_t keyring_id;
+	char key_desc[46], pubkey_bin[68];
+
+	keyring_id = find_key_by_type_and_desc("keyring", ".turris-signing-keys", 0);
+	if (keyring_id == -1)
+		return CKR_DEVICE_ERROR;
+
+	snprintf(key_desc, 46, "Turris MOX SN %.16s rWTM ECDSA key", token_info.serial_number);
+
+	keyctl_key_id = keyctl_search(keyring_id, "turris-signing-key", key_desc, 0);
+	if (keyctl_key_id == -1)
+		return CKR_DEVICE_ERROR;
+
+	if (keyctl_read(keyctl_key_id, pubkey_bin, 67) != 67) {
+		return CKR_DEVICE_ERROR;
+	}
+	pubkey_bin[67] = '\0';
+
+	/* convert to sysfs form for init_crypto() */
+	bin2hex(pubkey_str, pubkey_bin, 67);
+	pubkey_str[134] = '\0';
+
+	/* first two digits determine the y-bit */
+	if (pubkey_str[0] != '0' || (pubkey_str[1] != '2' && pubkey_str[1] != '3'))
+		return CKR_DEVICE_ERROR;
+
+	return CKR_OK;
 }
 
 static int init_crypto(const char *pubkey)
 {
-	EC_KEY *key;
-	BN_CTX *ctx;
-	EC_POINT *pub;
-	BIGNUM *pub_x;
-	unsigned char *des_pubkey;
-	int des_pubkey_len;
+	BN_CTX *bn_ctx;
+	EC_GROUP *group;
+	BIGNUM *pub_bn;
+	EC_POINT *pub_point;
+	unsigned char *compr_point_buf;
+	size_t compr_point_len;
+	OSSL_PARAM_BLD *param_bld;
+	OSSL_PARAM *params = NULL;
+	EVP_PKEY_CTX *ctx;
+	EVP_PKEY *pkey = NULL;
+	unsigned char *der_pubkey = NULL;
+	size_t der_pubkey_len;
 	ASN1_OCTET_STRING *asn1_pubkey;
-	const EC_GROUP *group;
 
-	key = EC_KEY_new_by_curve_name(NID_secp521r1);
-	if (!key)
-		goto fail;
+	bn_ctx = BN_CTX_new();
+	if (bn_ctx == NULL)
+		goto fail_bn_new;
 
-	group = EC_KEY_get0_group(key);
+	BN_CTX_start(bn_ctx);
+	pub_bn = BN_CTX_get(bn_ctx);
+	if (!pub_bn)
+		goto fail_bn;
 
-	ctx = BN_CTX_new();
-	if (!ctx)
-		goto fail_free_key;
+	if (!BN_hex2bn(&pub_bn, pubkey + 2))
+		goto fail_bn;
 
-	BN_CTX_start(ctx);
-	pub_x = BN_CTX_get(ctx);
-	if (!pub_x)
-		goto fail_end_ctx;
+	group = EC_GROUP_new_by_curve_name(NID_secp521r1);
+	if (group == NULL)
+		goto fail_group;
 
-	if (!BN_hex2bn(&pub_x, pubkey + 2))
-		goto fail_end_ctx;
+	pub_point = EC_POINT_new(group);
+	if (!pub_point)
+		goto fail_point;
 
-	pub = EC_POINT_new(group);
-	if (!pub)
-		goto fail_end_ctx;
+        if (!EC_POINT_set_compressed_coordinates(group, pub_point, pub_bn, pubkey[1] == '3', bn_ctx))
+                goto fail_point;
 
-	if (!EC_POINT_set_compressed_coordinates_GFp(group, pub, pub_x, pubkey[1] == '3', ctx))
-		goto fail_free_pub;
+	compr_point_len = EC_POINT_point2buf(group, pub_point, POINT_CONVERSION_COMPRESSED, &compr_point_buf, bn_ctx);
+	if (compr_point_len == 0)
+		goto fail_point_buf;
 
-	if (!EC_KEY_set_public_key(key, pub))
-		goto fail_free_pub;
+#ifdef MOX_DEBUG
+	printf("printing\n");
+	printf("0x%x\n", compr_point_len);
+	for (size_t i = 0; i < compr_point_len; i++)
+		printf("%02x ", compr_point_buf[i]);
+	printf("\n");
+#endif
+
+	param_bld = OSSL_PARAM_BLD_new();
+	if (param_bld == NULL
+		|| !OSSL_PARAM_BLD_push_utf8_string(param_bld, "group",
+			"secp521r1", 0)
+		|| !OSSL_PARAM_BLD_push_octet_string(param_bld, "pub",
+			compr_point_buf, compr_point_len)
+		)
+		goto fail_param_bld;
+
+	params = OSSL_PARAM_BLD_to_param(param_bld);
+	if (params == NULL)
+		goto fail_params;
+
+	ctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
+	if (ctx == NULL)
+		goto fail_pkey_ctx;
+
+	if (EVP_PKEY_fromdata_init(ctx) <= 0)
+		goto fail_pkey_ctx;
+
+	if (EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_PUBLIC_KEY, params) <= 0)
+		goto fail_pkey;
 
 	pub_attrs[4].value = NULL;
-	pub_attrs[4].value_len = i2d_ECParameters(key, (unsigned char **)&pub_attrs[4].value);
-	if (pub_attrs[4].value_len < 0)
-		goto fail_free_pub;
+	pub_attrs[4].value_len = i2d_KeyParams(pkey,
+			(unsigned char **)&pub_attrs[4].value);
+	if (pub_attrs[4].value_len == 0)
+		goto fail_attr_params;
 
-	des_pubkey = NULL;
-	des_pubkey_len = i2o_ECPublicKey(key, &des_pubkey);
-	if (des_pubkey_len < 0)
-		goto fail_free_ec_params;
+	der_pubkey_len = EVP_PKEY_get1_encoded_public_key(pkey, &der_pubkey);
+	if (der_pubkey_len == 0)
+		goto fail_der_pubkey;
 
 	asn1_pubkey = ASN1_OCTET_STRING_new();
 	if (!asn1_pubkey)
-		goto fail_free_des_pubkey;
-	if (!ASN1_OCTET_STRING_set(asn1_pubkey, des_pubkey, des_pubkey_len))
-		goto fail_free_asn1_pubkey;
+		goto fail_der_pubkey;
+	if (!ASN1_OCTET_STRING_set(asn1_pubkey, der_pubkey, der_pubkey_len))
+		goto fail_asn1_pubkey;
 
 	pub_attrs[3].value = NULL;
 	pub_attrs[3].value_len = i2d_ASN1_OCTET_STRING(asn1_pubkey, (unsigned char **)&pub_attrs[3].value);
 	if (pub_attrs[3].value_len < 0)
-		goto fail_free_asn1_pubkey;
+		goto fail_attr_point;
 
-	free(asn1_pubkey);
-	free(des_pubkey);
-	EC_POINT_free(pub);
-	BN_CTX_end(ctx);
-	BN_CTX_free(ctx);
-	EC_KEY_free(key);
+	OPENSSL_free(asn1_pubkey);
+	OPENSSL_free(der_pubkey);
+	EVP_PKEY_free(pkey);
+	EVP_PKEY_CTX_free(ctx);
+	OSSL_PARAM_free(params);
+	OSSL_PARAM_BLD_free(param_bld);
+	free(compr_point_buf);
+	EC_POINT_free(pub_point);
+	EC_GROUP_free(group);
+	BN_CTX_end(bn_ctx);
+	BN_CTX_free(bn_ctx);
 
-	return 0;
+	return CKR_OK;
 
-fail_free_asn1_pubkey:
-	free(asn1_pubkey);
-fail_free_des_pubkey:
-	free(des_pubkey);
-fail_free_ec_params:
-	free(pub_attrs[4].value);
-fail_free_pub:
-	EC_POINT_free(pub);
-fail_end_ctx:
-	BN_CTX_end(ctx);
-	BN_CTX_free(ctx);
-fail_free_key:
-	EC_KEY_free(key);
-fail:
+fail_attr_point:
+	OPENSSL_free(pub_attrs[3].value);
+fail_asn1_pubkey:
+	OPENSSL_free(asn1_pubkey);
+fail_der_pubkey:
+	OPENSSL_free(der_pubkey);
+fail_attr_params:
+	OPENSSL_free(pub_attrs[4].value);
+fail_pkey:
+	EVP_PKEY_free(pkey);
+fail_pkey_ctx:
+	EVP_PKEY_CTX_free(ctx);
+fail_params:
+	OSSL_PARAM_free(params);
+fail_param_bld:
+	OSSL_PARAM_BLD_free(param_bld);
+fail_point_buf:
+	free(compr_point_buf);
+fail_point:
+	EC_POINT_free(pub_point);
+fail_group:
+	EC_GROUP_free(group);
+fail_bn:
+	BN_CTX_end(bn_ctx);
+fail_bn_new:
+	BN_CTX_free(bn_ctx);
+
 	pub_attrs[3].value = pub_attrs[4].value = NULL;
 	pub_attrs[3].value_len = pub_attrs[4].value_len = 0;
 
-	return -1;
+	return CKR_FUNCTION_FAILED;
 }
 
-static ck_rv_t Initialize(void *init_args)
+static ck_rv_t init_token()
 {
-	const char *pubkey;
-	char buf[17];
+	char buf[16];
 	int res;
 
-	mox_sysfs_select_path_prefix();
+	if (mox_sysfs_read("serial_number", buf, 16) != 16)
+		return CKR_DEVICE_ERROR;
 
-	pubkey = read_pubkey();
-	if (!pubkey)
-		return CKR_FUNCTION_FAILED;
-
-	if (mox_sysfs_read("serial_number", buf, 17) != 17)
-		return CKR_FUNCTION_FAILED;
-
-	/* skip first zero so that we can push in terminating NUL byte */
-	memcpy(token_info.serial_number, &buf[1], 15);
-	token_info.serial_number[15] = '\0';
+	memcpy(token_info.serial_number, &buf, 16);
 
 	res = mox_sysfs_read("board_version", buf, 10);
 	if (res < 0)
-		return CKR_FUNCTION_FAILED;
-
-	if (res > 0) {
+		return CKR_DEVICE_ERROR;
+	else {
 		int board_version;
-
 		buf[res] = '\0';
-		sscanf(buf, "%d", &board_version);
+
+		if (sscanf(buf, "%d", &board_version) != 1)
+			return CKR_DEVICE_ERROR;
+
 		token_info.hardware_version.major = board_version;
 	}
 
-	if (init_crypto(pubkey))
-		return CKR_FUNCTION_FAILED;
+	return CKR_OK;
+}
+
+static ck_rv_t keyctl_initialize(void *init_args)
+{
+	int res;
+	char pubkey[135];
+
+	res = init_token();
+	if (res != CKR_OK)
+		return res;
+
+	res = keyctl_read_pubkey(pubkey);
+	if (res != CKR_OK)
+		return res;
+
+	res = init_crypto(pubkey);
+	if (res != CKR_OK)
+		return res;
+
+	sess.open = 0;
+
+	return CKR_OK;
+}
+
+static ck_rv_t sysfs_initialize(void *init_args)
+{
+	int res;
+	char pubkey[135];
+
+	res = init_token();
+	if (res != CKR_OK)
+		return res;
+
+	res = sysfs_read_pubkey(pubkey);
+	if (res != CKR_OK)
+		return res;
+
+	res = init_crypto(pubkey);
+	if (res != CKR_OK)
+		return res;
 
 	sess.open = 0;
 
@@ -334,7 +474,14 @@ static ck_rv_t GetInfo(struct ck_info *pinfo)
 
 ck_rv_t C_GetFunctionList(struct ck_function_list **pplist)
 {
-	*pplist = &fnc_list;
+	mox_sysfs_select_path_prefix();
+	if (path_prefix == NULL)
+		return CKR_TOKEN_NOT_PRESENT;
+
+	if (find_key_by_type_and_desc("keyring", ".turris-signing-keys", 0) != -1)
+		*pplist = &keyctl_fnc_list;
+	else
+		*pplist = &sysfs_fnc_list; /* fallback */
 	return CKR_OK;
 }
 
@@ -579,13 +726,12 @@ static ck_rv_t SignInit(ck_session_handle_t session,
 	return CKR_OK;
 }
 
-static ck_rv_t Sign(ck_session_handle_t session,
+static ck_rv_t keyctl_sign(ck_session_handle_t session,
 		    unsigned char *data, unsigned long data_len,
 		    unsigned char *signature,
 		    unsigned long *signature_len)
 {
-	unsigned char sig[136];
-	int fd;
+	int res;
 
 	if (session != 1 || !sess.open)
 		return CKR_SESSION_HANDLE_INVALID;
@@ -593,15 +739,52 @@ static ck_rv_t Sign(ck_session_handle_t session,
 	if (data_len != 64)
 		return CKR_DATA_LEN_RANGE;
 
-	fd = mox_sysfs_open("do_sign", O_RDWR);
-	if (fd < 0)
+	*signature_len = 132;
+	res = keyctl_pkey_sign(keyctl_key_id, "",
+			data, data_len,
+			signature, *signature_len);
+	if (res == -1)
 		return CKR_FUNCTION_FAILED;
+
+	return CKR_OK;
+}
+
+static ck_rv_t sysfs_sign(ck_session_handle_t session,
+		    unsigned char *data, unsigned long data_len,
+		    unsigned char *signature,
+		    unsigned long *signature_len)
+{
+	int fd;
+	unsigned char sig[136];
+	unsigned char use_debugfs = 0;
+
+	if (session != 1 || !sess.open)
+		return CKR_SESSION_HANDLE_INVALID;
+
+	if (data_len != 64)
+		return CKR_DATA_LEN_RANGE;
+
+	fd = open("/sys/kernel/debug/turris-mox-rwtm/do_sign", O_RDWR);
+	if (fd >= 0)
+		use_debugfs = 1;
+	else {
+		/* on old versions of turris os */
+		use_debugfs = 0;
+		fd = mox_sysfs_open("do_sign", O_RDWR);
+		if (fd < 0)
+			return CKR_FUNCTION_FAILED;
+	}
+
+	/* flush in the case of pending previous sig */
+	read(fd, sig, 136);
 
 	if (write(fd, data, data_len) != data_len)
 		goto fail;
 
-	if (lseek(fd, 0, SEEK_SET) < 0)
-		goto fail;
+	/* seek only on sysfs */
+	if (!use_debugfs)
+		if (lseek(fd, 0, SEEK_SET) < 0)
+			goto fail;
 
 	if (read(fd, sig, 136) != 136)
 		goto fail;
@@ -618,12 +801,15 @@ fail:
 	return CKR_FUNCTION_FAILED;
 }
 
-static struct ck_function_list fnc_list = {
+/*
+ * Used when keyctl API for MOX is supported (Linux >=6.16)
+ */
+static struct ck_function_list keyctl_fnc_list = {
 	.version = {
 		.major = CRYPTOKI_VERSION_MAJOR,
 		.minor = CRYPTOKI_VERSION_MINOR,
 	},
-	.C_Initialize = Initialize,
+	.C_Initialize = keyctl_initialize,
 	.C_Finalize = Finalize,
 	.C_GetInfo = GetInfo,
 	.C_GetFunctionList = C_GetFunctionList,
@@ -640,5 +826,34 @@ static struct ck_function_list fnc_list = {
 	.C_GetAttributeValue = GetAttributeValue,
 
 	.C_SignInit = SignInit,
-	.C_Sign = Sign,
+	.C_Sign = keyctl_sign,
+};
+
+/*
+ * Used as fallback when keyctl API for accessing the key is not supported
+ * (Linux <=6.15)
+ */
+static struct ck_function_list sysfs_fnc_list = {
+	.version = {
+		.major = CRYPTOKI_VERSION_MAJOR,
+		.minor = CRYPTOKI_VERSION_MINOR,
+	},
+	.C_Initialize = sysfs_initialize,
+	.C_Finalize = Finalize,
+	.C_GetInfo = GetInfo,
+	.C_GetFunctionList = C_GetFunctionList,
+	.C_GetSlotList = GetSlotList,
+	.C_GetSlotInfo = GetSlotInfo,
+	.C_GetTokenInfo = GetTokenInfo,
+
+	.C_OpenSession = OpenSession,
+	.C_CloseSession = CloseSession,
+	.C_FindObjectsInit = FindObjectsInit,
+	.C_FindObjects = FindObjects,
+	.C_FindObjectsFinal = FindObjectsFinal,
+
+	.C_GetAttributeValue = GetAttributeValue,
+
+	.C_SignInit = SignInit,
+	.C_Sign = sysfs_sign,
 };
